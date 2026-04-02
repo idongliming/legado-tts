@@ -146,7 +146,7 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
             downloadTaskActiveLock.withLock {
                 Log.i(tag, "普通下载contentList size===> ${contentList.size}")
                 // 方案一：一一对应，每个段落独立生成音频文件
-                for (index in contentList.size) {
+                for (index in contentList.indices) {
                     ensureActive()
                     var content = contentList[index]
                     if (index < nowSpeak) {
@@ -212,7 +212,7 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
         preDownloadTask = execute {
             preDownloadTaskActiveLock.withLock {
                 // 方案一：每个段落独立预读，不使用批量逻辑
-                for (index in preContentList.size) {
+                for (index in preContentList.indices) {
                     coroutineContext.ensureActive()
                     val content = preContentList[index]
                     val fileName = md5SpeakFileName(content)
@@ -227,7 +227,7 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
                 }
             }
         }.onError {
-            Log.d(tag.d, "预下载出错")
+            Log.d(tag, "预下载出错")
         }
     }
 
@@ -292,7 +292,7 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
             if (exoPlayer.duration <= 0) {
                 return@launch
             }
-            val speakTextLength = if (nowSpeak in contentList.size) {
+            val speakTextLength = if (nowSpeak < contentList.size) {
                 contentList[nowSpeak].length
             } else {
                 Log.e(
@@ -441,7 +441,7 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
             audioCacheList.add(key)
             Log.d(tag, "成功缓存 cacheAudio: $key")
             true
-        } catch (e.e: Exception) {
+        } catch (e: Exception) {
             Log.d(tag, "缓存失败 cacheAudio: $key")
             e.printStackTrace()
             false
