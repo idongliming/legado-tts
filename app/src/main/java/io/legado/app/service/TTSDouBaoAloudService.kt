@@ -56,9 +56,6 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
     private var speechRate: Int = AppConfig.speechRatePlay + 5
     private var downloadTask: Coroutine<*>? = null
     private val downloadTaskActiveLock = Mutex()
-    private var preDownloadTask: Coroutine<*>? = null
-    private val preDownloadTaskActiveLock = Mutex()
-
     private var playIndexJob: Job? = null
     private var playErrorNo = 0
     private var isReloadAudio = 0
@@ -145,14 +142,11 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
         downloadTask = execute {
             downloadTaskActiveLock.withLock {
                 Log.i(tag, "普通下载contentList size===> ${contentList.size}")
-                // 方案一：一一对应，每个段落独立生成音频文件
-                for (index in contentList.indices) {
+                // 一次TTS播放完成才能请求下一次：仅处理当前段落
+                if (nowSpeak in contentList.indices) {
                     ensureActive()
-                    var content = contentList[index]
-                    if (index < nowSpeak) {
-                        continue
-                    }
-                    if (paragraphStartPos > 0 && index == nowSpeak) {
+                    var content = contentList[nowSpeak]
+                    if (paragraphStartPos > 0) {
                         content = content.substring(paragraphStartPos)
                     }
                     val fileName = md5SpeakFileName(content)
@@ -182,12 +176,10 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
                         .build()
                     launch(Main) {
                         exoPlayer.addMediaItem(mediaItem)
-                    }
-
-                    // 判断是否快要读完本章, 启动预下载
-                    if (contentList.lastIndex == index) {
-                        Log.d(tag, "即将读完, 启动预下载")
-                        preDownloadAudios()
+                        if (exoPlayer.playbackState == Player.STATE_IDLE || exoPlayer.playbackState == Player.STATE_ENDED) {
+                            exoPlayer.prepare()
+                            exoPlayer.play()
+                        }
                     }
                 }
             }
@@ -198,38 +190,7 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
         }
     }
 
-    private fun preDownloadAudios() {
-        Log.i(tag, "准备预下载音频===> ${ReadBook.nextTextChapter}")
-        val textChapter = ReadBook.nextTextChapter ?: return
-        // 方案一：一一对应，每个段落独立预读，限制前10段
-        val preContentList =
-            textChapter.getNeedReadAloud(0, readAloudByPage, 0, 1).splitToSequence("\n")
-                .filter { it.isNotEmpty() }
-                .take(10)  // 只预读前10段，参考EdgeTTS
-                .toList()
-        Log.i(tag, "开启预下载任务===> ${preContentList.size}")
-        preDownloadTask?.cancel()
-        preDownloadTask = execute {
-            preDownloadTaskActiveLock.withLock {
-                // 方案一：每个段落独立预读，不使用批量逻辑
-                for (index in preContentList.indices) {
-                    coroutineContext.ensureActive()
-                    val content = preContentList[index]
-                    val fileName = md5SpeakFileName(content)
-                    val speakText = content.replace(AppPattern.notReadAloudRegex, "")
 
-                    Log.i(tag, "预下载段落 $index/${preContentList.size}: $speakText")
-                    runCatching {
-                        getSpeakStream(speakText, fileName)
-                    }.onFailure {
-                        Log.e(tag, "预下载段落${index}失败", it)
-                    }
-                }
-            }
-        }.onError {
-            Log.d(tag, "预下载出错")
-        }
-    }
 
     private suspend fun getSpeakStream(speakText: String, fileName: String): String {
         if (speakText.isEmpty()) {
@@ -363,9 +324,13 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
                 // 结束
                 playErrorNo = 0
                 isReloadAudio = 0
+                val oldNowSpeak = nowSpeak
                 updateNextPos()
                 exoPlayer.stop()
                 Log.d(tag, "播放完毕==> 更新 updateNextPos()")
+                if (oldNowSpeak < contentList.lastIndex && !pause) {
+                    downloadAndPlayAudios()
+                }
             }
         }
     }

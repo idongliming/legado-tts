@@ -217,7 +217,7 @@ class DouBaoFetch {
                             Log.d(TAG, "WebSocket连接成功")
                         } else if ("sentence_start" == event) {
                             val readableText = data.optJSONObject("sentence_start_result")
-                                .optString("readable_text", "")
+                                ?.optString("readable_text", "") ?: ""
                             Log.d(
                                 TAG,
                                 "开始合成句子: " + readableText.substring(
