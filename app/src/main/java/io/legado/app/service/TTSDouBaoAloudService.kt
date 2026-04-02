@@ -59,7 +59,7 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
     private var preDownloadTask: Coroutine<*>? = null
     private val preDownloadTaskActiveLock = Mutex()
 
-    private var play:IndexJob: Job? = null
+    private var playIndexJob: Job? = null
     private var playErrorNo = 0
     private var isReloadAudio = 0
     private val doubaoFetch = DouBaoFetch()
@@ -115,7 +115,7 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
 
     override fun playStop() {
         exoPlayer.stop()
-        play:IndexJob?.cancel()
+        playIndexJob?.cancel()
     }
 
     private fun updateNextPos() {
@@ -266,7 +266,7 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
         super.pauseReadAloud(abandonFocus)
         Log.i(tag, "pauseReadAloud")
         kotlin.runCatching {
-            play:IndexJob?.cancel()
+            playIndexJob?.cancel()
             exoPlayer.pause()
         }
 
@@ -285,9 +285,9 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
     }
 
     private fun upPlayPos() {
-        play:IndexJob?.cancel()
+        playIndexJob?.cancel()
         val textChapter = textChapter ?: return
-        play:IndexJob = lifecycleScope.launch {
+        playIndexJob = lifecycleScope.launch {
             upTtsProgress(readAloudNumber + 1)
             if (exoPlayer.duration <= 0) {
                 return@launch
