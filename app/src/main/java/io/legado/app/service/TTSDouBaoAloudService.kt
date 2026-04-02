@@ -222,7 +222,7 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
                     runCatching {
                         getSpeakStream(speakText, fileName)
                     }.onFailure {
-                        Log.e(tag, "预下载段落$index失败", it)
+                        Log.e(tag, "预下载段落${index}失败", it)
                     }
                 }
             }
