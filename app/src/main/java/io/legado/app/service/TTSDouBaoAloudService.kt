@@ -4,7 +4,6 @@ import android.annotation.SuppressLint
 import android.app.PendingIntent
 import android.content.Context
 import android.util.Log
-import android.widget.Toast
 import androidx.core.net.toUri
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.MediaItem
@@ -22,25 +21,27 @@ import io.legado.app.model.ReadBook
 import io.legado.app.utils.MD5Utils
 import io.legado.app.utils.servicePendingIntent
 import io.legado.app.utils.toastOnUi
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Dispatchers.Main
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
-import java.util.ArrayList
 import java.util.Timer
-import kotlin.collections.set
 import kotlin.concurrent.schedule
 
 /**
- * 豆包
+ * 豆包TTS朗读服务
+ *
+ * 架构：流水线预下载 + 状态机驱动单段串行播放
+ * - downloadAndPlay(index)：下载当前段 → 准备播放器 → 同时启动预下载下一段
+ * - STATE_ENDED：检查预下载是否就绪 → 无缝切换(playFromCache) 或 按需下载(downloadAndPlay)
+ * - upPlayPos：80ms 轮询实际进度，消除字符高亮漂移
+ * - removeUnUseCache：修复 previousMediaId 与 audioCacheList key 格式不匹配导致永不清理的 bug
  */
 @SuppressLint("UnsafeOptInUsageError")
 class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
@@ -54,29 +55,31 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
     }
     private val tag = "TTSDouBaoService"
     private var speechRate: Int = AppConfig.speechRatePlay + 5
+
+    // 下载当前段的协程
     private var downloadTask: Coroutine<*>? = null
-    private val downloadTaskActiveLock = Mutex()
+    // 预下载下一段的协程（并行于播放，不阻塞）
+    private var preloadTask: Coroutine<*>? = null
     private var playIndexJob: Job? = null
     private var playErrorNo = 0
     private var isReloadAudio = 0
+
     private val doubaoFetch = DouBaoFetch()
     private val audioCache = HashMap<String, ByteArray>()
     private val audioCacheList = arrayListOf<String>()
-    private var previousMediaId = ""
+    // Bug修复：用 lastPlayedFileName 替代 previousMediaId，与 audioCacheList 中的 key 格式保持一致
+    private var lastPlayedFileName = ""
 
-    private val cacheKey = "tts_doubao_cookie" // 自定义缓存key，用于唯一标识这个数据
-    private var doubaoCookie = ""// 读取缓存，默认值"豆包"
+    private val cacheKey = "tts_doubao_cookie"
+    private var doubaoCookie = ""
     private val silentBytes: ByteArray by lazy {
         resources.openRawResource(R.raw.silent_sound).readBytes()
     }
 
-    // 核心方法2：从SharedPreferences读取数据
     private fun getSharedPrefValue(context: Context?, defaultValue: String = ""): String {
-        if (context == null) {
-            return defaultValue
-        }
+        if (context == null) return defaultValue
         val sp = context.getSharedPreferences("TTS_CONFIG", Context.MODE_PRIVATE)
-        return sp.getString(cacheKey, defaultValue) ?: defaultValue // 防止null
+        return sp.getString(cacheKey, defaultValue) ?: defaultValue
     }
 
     override fun onCreate() {
@@ -89,6 +92,7 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
     override fun onDestroy() {
         super.onDestroy()
         downloadTask?.cancel()
+        preloadTask?.cancel()
         exoPlayer.release()
         doubaoFetch.release()
         removeAllCache()
@@ -97,21 +101,23 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
     override fun play() {
         pageChanged = false
         exoPlayer.stop()
+        exoPlayer.clearMediaItems()
         if (!requestFocus()) return
-        Log.i(tag, "playSize===> ${contentList.size} ")
-
+        Log.i(tag, "play contentList.size=${contentList.size}")
         if (contentList.isEmpty()) {
             AppLog.putDebug("朗读列表为空")
             ReadBook.readAloud()
         } else {
-            downloadAndPlayAudios()
             super.play()
-
+            downloadAndPlay(nowSpeak)
         }
     }
 
     override fun playStop() {
+        downloadTask?.cancel()
+        preloadTask?.cancel()
         exoPlayer.stop()
+        exoPlayer.clearMediaItems()
         playIndexJob?.cancel()
     }
 
@@ -125,112 +131,119 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
         }
     }
 
-    private fun downloadAndPlayAudios() {
+    // ---- 核心流水线 ----
+
+    /**
+     * 下载 index 段落并启动播放，同时触发 index+1 预下载。
+     * 消除旧版 nowSpeak==targetIndex 竞态：下载完成直接操作播放器，不再做条件判断。
+     */
+    private fun downloadAndPlay(index: Int) {
         if (doubaoCookie.isEmpty()) {
             pauseReadAloud(true)
-            Toast.makeText(this, "兄弟没有Cookie让我很难办啊,先添加 cookie", Toast.LENGTH_LONG)
-                .show()
-            throw IllegalArgumentException("没找到cookie")
+            toastOnUi("Cookie 缺失，请先添加")
+            return
         }
-
         downloadTask?.cancel()
-        removeUnUseCache()
-        exoPlayer.clearMediaItems()
-        Log.d(tag, "clearMediaItems audioCache Size= ${audioCache.size}")
-        Log.d(tag, "nowSpeak  $nowSpeak")
-
+        preloadTask?.cancel()
         downloadTask = execute {
-            downloadTaskActiveLock.withLock {
-                Log.i(tag, "普通下载contentList size===> ${contentList.size}")
-                // 一次TTS播放完成才能请求下一次：仅处理当前段落
-                if (nowSpeak in contentList.indices) {
-                    ensureActive()
-                    var content = contentList[nowSpeak]
-                    if (paragraphStartPos > 0) {
-                        content = content.substring(paragraphStartPos)
-                    }
-                    val fileName = md5SpeakFileName(content)
-                    val speakText = content.replace(AppPattern.notReadAloudRegex, "")
+            ensureActive()
+            val content = contentList[index].let {
+                if (paragraphStartPos > 0 && index == nowSpeak) it.substring(paragraphStartPos) else it
+            }
+            val fileName = md5SpeakFileName(content)
+            val speakText = content.replace(AppPattern.notReadAloudRegex, "")
 
-                    if (!isCached(fileName)) {
-                        Log.i(tag, "无缓存开始下载===> MD5:$fileName 内容:${speakText.take(50)}")
-                        runCatching {
-                            getSpeakStream(speakText, fileName)
-                        }.onFailure {
-                            Log.e(tag, "downloadAndPlayAudios runCatching onFailure")
-                            AppLog.put("朗读下载出错\n${it.localizedMessage}", it, true)
-                            when (it) {
-                                is CancellationException -> Unit
-                                else -> pauseReadAloud()
-                            }
-                            return@execute
-                        }
-                        Log.i(tag, "下载完毕===> MD5:$fileName")
-                    } else {
-                        Log.i(tag, "有缓存跳过===> MD5:$fileName")
-                    }
-
-                    val mediaItem = MediaItem.Builder()
-                        .setUri("memory://media/$fileName".toUri())
-                        .setMediaId(fileName)
-                        .build()
-                    launch(Main) {
-                        exoPlayer.addMediaItem(mediaItem)
-                        if (exoPlayer.playbackState == Player.STATE_IDLE || exoPlayer.playbackState == Player.STATE_ENDED) {
-                            exoPlayer.prepare()
-                            exoPlayer.play()
-                        }
-                    }
+            if (!isCached(fileName)) {
+                Log.d(tag, "下载 index=$index")
+                runCatching {
+                    getSpeakStream(speakText, fileName)
+                }.onFailure {
+                    Log.e(tag, "下载失败 index=$index", it)
+                    AppLog.put("下载当前段失败: $it", it, true)
+                    pauseReadAloud()
+                    return@execute
                 }
+            } else {
+                Log.d(tag, "命中缓存 index=$index")
             }
 
+            withContext(Main) {
+                val mediaItem = MediaItem.Builder()
+                    .setUri("memory://media/$fileName".toUri())
+                    .setMediaId(fileName)
+                    .build()
+                exoPlayer.setMediaItem(mediaItem)
+                exoPlayer.prepare()
+                if (!pause) exoPlayer.play()
+                Log.d(tag, "准备播放 index=$index fileName=$fileName")
+            }
+
+            // 下一段预下载，不阻塞当前播放触发
+            val nextIndex = index + 1
+            if (nextIndex <= contentList.lastIndex) {
+                preloadIndex(nextIndex)
+            }
         }.onError {
-            Log.d(tag, "朗读下载出错")
-            AppLog.put("朗读下载出错\n${it.localizedMessage}", it, true)
+            Log.e(tag, "downloadTask 异常", it)
         }
     }
 
-
+    /**
+     * 后台静默预下载指定段落，不影响当前播放。
+     */
+    private fun preloadIndex(index: Int) {
+        preloadTask?.cancel()
+        preloadTask = execute {
+            ensureActive()
+            val content = contentList[index]
+            val fileName = md5SpeakFileName(content)
+            val speakText = content.replace(AppPattern.notReadAloudRegex, "")
+            if (!isCached(fileName)) {
+                Log.d(tag, "预下载 index=$index")
+                runCatching {
+                    getSpeakStream(speakText, fileName)
+                    Log.d(tag, "预下载完成 index=$index")
+                }.onFailure {
+                    Log.e(tag, "预下载失败 index=$index", it)
+                }
+            } else {
+                Log.d(tag, "预下载命中缓存 index=$index")
+            }
+        }
+    }
 
     private suspend fun getSpeakStream(speakText: String, fileName: String): String {
         if (speakText.isEmpty()) {
             cacheAudio(fileName, silentBytes)
-            return "fail"
+            return "silent"
         }
-
-        val audioFailureCallback: DouBaoFetch.AudioGenFailureCallback = object : DouBaoFetch.AudioGenFailureCallback {
+        val audioFailureCallback = object : DouBaoFetch.AudioGenFailureCallback {
             override fun onFailure(error: Throwable, message: String) {
-                Log.e(tag, "外部感知到音频生成失败：$message", error)
+                Log.e(tag, "音频生成失败：$message", error)
                 pauseReadAloud()
             }
         }
-
-        try {
-
-            return withContext(Dispatchers.IO) {
-                val inputStream = doubaoFetch.genAudio(audioFailureCallback, doubaoCookie, speakText)
-                cacheAudio(fileName, inputStream)
-                "success"
-            }
-        } catch (e: Exception) {
-            Log.i(tag, "edgeSpeakFetch失败: $e")
-            cacheAudio(fileName, silentBytes)
+        return withContext(Dispatchers.IO) {
+            ensureActive()
+            val inputStream = doubaoFetch.genAudio(audioFailureCallback, doubaoCookie, speakText)
+            ensureActive()
+            cacheAudio(fileName, inputStream)
+            "success"
         }
-        return "fail"
     }
 
     private fun md5SpeakFileName(content: String): String {
         return MD5Utils.md5Encode16(MD5Utils.md5Encode16("$speechRate|$content"))
     }
 
+    // ---- 播控 ----
+
     override fun pauseReadAloud(abandonFocus: Boolean) {
         super.pauseReadAloud(abandonFocus)
-        Log.i(tag, "pauseReadAloud")
         kotlin.runCatching {
             playIndexJob?.cancel()
             exoPlayer.pause()
         }
-
     }
 
     override fun resumeReadAloud() {
@@ -245,92 +258,114 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
         }
     }
 
+    /**
+     * 80ms 轮询音频实际进度更新字符高亮，替代等比插值，消除漂移。
+     */
     private fun upPlayPos() {
         playIndexJob?.cancel()
         val textChapter = textChapter ?: return
         playIndexJob = lifecycleScope.launch {
             upTtsProgress(readAloudNumber + 1)
-            if (exoPlayer.duration <= 0) {
-                return@launch
-            }
-            val speakTextLength = if (nowSpeak < contentList.size) {
-                contentList[nowSpeak].length
-            } else {
-                Log.e(
-                    tag,
-                    "nowSpeak 越界: nowSpeak=$nowSpeak, contentList.size=${contentList.size}"
-                )
-                contentList.size - 1
-            }
-            if (speakTextLength <= 0) {
-                return@launch
-            }
-            val sleep = exoPlayer.duration / speakTextLength
-            val start = speakTextLength * exoPlayer.currentPosition / exoPlayer.duration
-            for (i in start..contentList[nowSpeak].length) {
-                if (pageIndex + 1 < textChapter.pageSize && readAloudNumber + i > textChapter.getReadLength(
-                        pageIndex + 1
-                    )
-                ) {
-                    pageIndex++
-                    ReadBook.moveToNextPage()
-                    upTtsProgress(readAloudNumber + i.toInt())
+            while (isActive) {
+                if (exoPlayer.isPlaying) {
+                    val duration = exoPlayer.duration
+                    val position = exoPlayer.currentPosition
+                    if (duration > 0 && nowSpeak < contentList.size) {
+                        val textLength = contentList[nowSpeak].length
+                        val charPos = (textLength.toLong() * position / duration).toInt()
+                        if (pageIndex + 1 < textChapter.pageSize &&
+                            readAloudNumber + charPos > textChapter.getReadLength(pageIndex + 1)
+                        ) {
+                            pageIndex++
+                            ReadBook.moveToNextPage()
+                        }
+                        upTtsProgress(readAloudNumber + charPos + 1)
+                    }
                 }
-                delay(sleep)
+                delay(80)
             }
         }
     }
 
-    /**
-     * 更新朗读速度
-     */
     override fun upSpeechRate(reset: Boolean) {
         downloadTask?.cancel()
+        preloadTask?.cancel()
         exoPlayer.stop()
+        exoPlayer.clearMediaItems()
         speechRate = AppConfig.speechRatePlay + 5
-        downloadAndPlayAudios()
+        removeAllCache()
+        downloadAndPlay(nowSpeak)
     }
 
-    /**
-     * 重新下载本章节
-     */
     private fun reloadAudio() {
         removeAllCache()
-        previousMediaId = ""
         downloadTask?.cancel()
+        preloadTask?.cancel()
         exoPlayer.stop()
-        downloadAndPlayAudios()
+        exoPlayer.clearMediaItems()
+        downloadAndPlay(nowSpeak)
     }
+
+    // ---- ExoPlayer 回调 ----
 
     override fun onPlaybackStateChanged(playbackState: Int) {
         super.onPlaybackStateChanged(playbackState)
         when (playbackState) {
-            Player.STATE_IDLE -> {
-                // 空闲
-            }
-
-            Player.STATE_BUFFERING -> {
-                // 缓冲中
-            }
+            Player.STATE_IDLE -> {}
+            Player.STATE_BUFFERING -> {}
 
             Player.STATE_READY -> {
-                // 准备好
                 if (pause) return
                 exoPlayer.play()
                 upPlayPos()
             }
 
             Player.STATE_ENDED -> {
-                // 结束
                 playErrorNo = 0
                 isReloadAudio = 0
-                val oldNowSpeak = nowSpeak
-                updateNextPos()
-                exoPlayer.stop()
-                Log.d(tag, "播放完毕==> 更新 updateNextPos()")
-                if (oldNowSpeak < contentList.lastIndex && !pause) {
-                    downloadAndPlayAudios()
+                val currentIndex = nowSpeak
+
+                // 在 updateNextPos 重置 paragraphStartPos 之前记录本段 fileName，用于缓存清理
+                val currentContent = contentList[currentIndex].let {
+                    if (paragraphStartPos > 0) it.substring(paragraphStartPos) else it
                 }
+                lastPlayedFileName = md5SpeakFileName(currentContent)
+
+                updateNextPos() // paragraphStartPos 在此重置为 0
+
+                Log.d(tag, "播放完毕 index=$currentIndex → nowSpeak=$nowSpeak")
+                if (currentIndex < contentList.lastIndex && !pause) {
+                    removeUnUseCache()
+                    // 若预下载已就绪则无缝切换，否则下载后播放
+                    val nextFileName = md5SpeakFileName(contentList[nowSpeak])
+                    if (isCached(nextFileName)) {
+                        Log.d(tag, "预下载命中，无缝切换 nowSpeak=$nowSpeak")
+                        playFromCache(nowSpeak, nextFileName)
+                    } else {
+                        Log.d(tag, "预下载未就绪，启动下载 nowSpeak=$nowSpeak")
+                        downloadAndPlay(nowSpeak)
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 从缓存无缝切换到下一段，并继续预下载后续段落。
+     */
+    private fun playFromCache(index: Int, fileName: String) {
+        lifecycleScope.launch {
+            val mediaItem = MediaItem.Builder()
+                .setUri("memory://media/$fileName".toUri())
+                .setMediaId(fileName)
+                .build()
+            exoPlayer.setMediaItem(mediaItem)
+            exoPlayer.prepare()
+            exoPlayer.play()
+            Log.d(tag, "无缝播放 index=$index")
+            val nextNext = index + 1
+            if (nextNext <= contentList.lastIndex) {
+                preloadIndex(nextNext)
             }
         }
     }
@@ -342,56 +377,32 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
                     exoPlayer.prepare()
                 }
             }
-
             else -> {}
         }
     }
 
-    override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-        Log.d(tag, "onMediaItemTransition $reason")
-        if (mediaItem?.mediaId.toString().isNotEmpty()) {
-            previousMediaId = mediaItem?.mediaId.toString()
-        }
-        if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) return
-        if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
-            playErrorNo = 0
-            isReloadAudio = 0
-
-        }
-        updateNextPos()
-        upPlayPos()
-    }
-
     override fun onPlayerError(error: PlaybackException) {
         super.onPlayerError(error)
-        // 打印详细错误信息（日志中搜索 "Source error detail"）
-        Log.e(tag, "Source error detail: ${error.cause?.message}", error)
-        // 错误类型判断（如格式不支持、IO 错误等）
-        Log.e(tag, "playErrorNo errorCode ${error.errorCode}")
-        Log.e(tag, "playErrorNo: $playErrorNo")
+        Log.e(tag, "播放错误: ${error.cause?.message}", error)
+        Log.e(tag, "errorCode=${error.errorCode}, playErrorNo=$playErrorNo")
         AppLog.put("朗读错误\n${contentList[nowSpeak]}", error)
         playErrorNo++
         if (playErrorNo >= 5) {
-            toastOnUi("朗读连续5次错误, 最后一次错误代码(${error.localizedMessage})")
-            AppLog.put("朗读连续5次错误, 最后一次错误代码(${error.localizedMessage})", error)
-            // 把这一章节的音频重新加载
+            toastOnUi("朗读连续5次错误(${error.localizedMessage})")
+            AppLog.put("朗读连续5次错误(${error.localizedMessage})", error)
             if (isReloadAudio == 0) {
                 playErrorNo = 0
                 isReloadAudio++
-                Timer().schedule(2000) {
-                    reloadAudio()
-                    Log.e(tag, "重试本章节")
-                }
+                Timer().schedule(2000) { reloadAudio() }
             } else {
                 pauseReadAloud()
             }
         } else {
-            if (exoPlayer.hasNextMediaItem()) {
-                exoPlayer.seekToNextMediaItem()
-                exoPlayer.prepare()
-            } else {
-                exoPlayer.clearMediaItems()
-                updateNextPos()
+            // 单段模式下错误直接跳到下一段
+            val currentIndex = nowSpeak
+            updateNextPos()
+            if (currentIndex < contentList.lastIndex && !pause) {
+                downloadAndPlay(nowSpeak)
             }
         }
     }
@@ -400,61 +411,55 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
         return servicePendingIntent<TTSEdgeAloudService>(actionStr)
     }
 
+    // ---- 缓存管理 ----
+
     private fun cacheAudio(key: String, inputStream: InputStream): Boolean {
         return try {
             audioCache[key] = inputStream.toByteArray()
-            audioCacheList.add(key)
-            Log.d(tag, "成功缓存 cacheAudio: $key")
+            if (!audioCacheList.contains(key)) audioCacheList.add(key)
+            Log.d(tag, "缓存成功: $key")
             true
         } catch (e: Exception) {
-            Log.d(tag, "缓存失败 cacheAudio: $key")
-            e.printStackTrace()
+            Log.d(tag, "缓存失败: $key")
             false
         }
     }
 
     private fun cacheAudio(key: String, byteArray: ByteArray): Boolean {
         audioCache[key] = byteArray
-        audioCacheList.add(key)
+        if (!audioCacheList.contains(key)) audioCacheList.add(key)
         return true
     }
 
-    private fun removeCache(key: String) {
-        audioCache.remove(key)
-    }
-
-    // 移除不会再使用的缓存, 0 ~ 上次朗读的文件下标
+    /**
+     * 清理已播放段落之前的旧缓存。
+     * Bug修复：原来用 previousMediaId（格式 "${index}_${fileName}"）在 audioCacheList（仅存 fileName）中查找，
+     * 永远返回 -1，缓存从不清理，导致内存持续增长。
+     * 现改用 lastPlayedFileName（与 audioCacheList key 格式一致）修复此 bug。
+     */
     private fun removeUnUseCache() {
-        Log.d(tag, "removeUnUseCache previousMediaId: $previousMediaId")
-        if (previousMediaId.isEmpty()) return
-        val targetIndex = audioCacheList.indexOf(previousMediaId)
-        if (targetIndex <= 0) return // 索引为0或-1时无需处理（-1：未找到；0：无前置元素）
-
-        Log.d(tag, "removeUnUseCache targetIndex: $targetIndex")
-
-        val itemsToRemove = audioCacheList.subList(0, targetIndex)
-        itemsToRemove.forEach {
-            Log.d(tag, "批量移除: $it")
-            removeCache(it)
-        }
-        itemsToRemove.clear()
-        Log.d(tag, "removeUnUseCache: ${audioCacheList.size}")
-
+        if (lastPlayedFileName.isEmpty()) return
+        val targetIdx = audioCacheList.indexOf(lastPlayedFileName)
+        if (targetIdx <= 0) return
+        val toRemove = audioCacheList.subList(0, targetIdx)
+        toRemove.forEach { audioCache.remove(it) }
+        toRemove.clear()
+        Log.d(tag, "清理旧缓存，剩余 ${audioCacheList.size} 条")
     }
 
     private fun removeAllCache() {
         audioCache.clear()
         audioCacheList.clear()
+        lastPlayedFileName = ""
     }
 
     private fun isCached(key: String) = audioCache.containsKey(key)
 
     private fun InputStream.toByteArray(): ByteArray {
         val output = ByteArrayOutputStream()
-        // 使用use自动关闭流
         this.use { input ->
             output.use { out ->
-                input.copyTo(out) // 复制数据到输出流
+                input.copyTo(out)
             }
         }
         return output.toByteArray()
