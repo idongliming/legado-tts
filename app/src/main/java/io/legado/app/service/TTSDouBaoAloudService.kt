@@ -178,10 +178,10 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
                 Log.d(tag, "准备播放 index=$index fileName=$fileName")
             }
 
-            // 下一段预下载，不阻塞当前播放触发
+            // 播放已触发，立即启动批量预下载（下载起点为 index+1，最多预取3段）
             val nextIndex = index + 1
             if (nextIndex <= contentList.lastIndex) {
-                preloadIndex(nextIndex)
+                preloadBatch(nextIndex)
             }
         }.onError {
             Log.e(tag, "downloadTask 异常", it)
@@ -189,25 +189,31 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
     }
 
     /**
-     * 后台静默预下载指定段落，不影响当前播放。
+     * 后台批量预下载 [startIndex, startIndex+3) 区间内的段落，顺序下载优先保障 startIndex。
+     * 每段之间设有 ensureActive() 检查点：downloadAndPlay 需要优先下载时，
+     * cancel() 信号会在段落间隙被即时响应，不会阻塞紧急下载流程。
      */
-    private fun preloadIndex(index: Int) {
+    private fun preloadBatch(startIndex: Int) {
         preloadTask?.cancel()
         preloadTask = execute {
-            ensureActive()
-            val content = contentList[index]
-            val fileName = md5SpeakFileName(content)
-            val speakText = content.replace(AppPattern.notReadAloudRegex, "")
-            if (!isCached(fileName)) {
-                Log.d(tag, "预下载 index=$index")
-                runCatching {
-                    getSpeakStream(speakText, fileName)
-                    Log.d(tag, "预下载完成 index=$index")
-                }.onFailure {
-                    Log.e(tag, "预下载失败 index=$index", it)
+            val endIndex = (startIndex + 3).coerceAtMost(contentList.size)
+            for (i in startIndex until endIndex) {
+                ensureActive() // 段落间隙：downloadAndPlay cancel 后可在此立即退出
+                val content = contentList[i]
+                val fileName = md5SpeakFileName(content)
+                val speakText = content.replace(AppPattern.notReadAloudRegex, "")
+                if (!isCached(fileName)) {
+                    Log.d(tag, "预下载 index=$i (批次 $startIndex~${endIndex - 1})")
+                    runCatching {
+                        getSpeakStream(speakText, fileName)
+                        Log.d(tag, "预下载完成 index=$i")
+                    }.onFailure {
+                        Log.e(tag, "预下载失败 index=$i", it)
+                        // 单段失败不中断后续段落的预下载
+                    }
+                } else {
+                    Log.d(tag, "预下载已有缓存 index=$i")
                 }
-            } else {
-                Log.d(tag, "预下载命中缓存 index=$index")
             }
         }
     }
@@ -363,9 +369,10 @@ class TTSDouBaoAloudService : BaseReadAloudService(), Player.Listener {
             exoPlayer.prepare()
             exoPlayer.play()
             Log.d(tag, "无缝播放 index=$index")
+            // 无缝切换后继续批量预下载后续3段
             val nextNext = index + 1
             if (nextNext <= contentList.lastIndex) {
-                preloadIndex(nextNext)
+                preloadBatch(nextNext)
             }
         }
     }
