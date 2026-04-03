@@ -57,7 +57,7 @@ class DouBaoFetch {
     fun removeSpecialCharacters(text: String?): String {
         if (text == null || text.isEmpty()) return ""
         val decodedText = URLDecoder.decode(text, StandardCharsets.UTF_8)
-        val pattern = Pattern.compile("[^\\w\\s\u4e00-\u9fff，。！？；：、（）《》【】""'']")
+        val pattern = Pattern.compile("[^\\w\\s\u4e00-\u9fff，。！？；：、（）《》【】\u201c\u201d\u2018\u2019]")
         return pattern.matcher(decodedText).replaceAll("")
     }
 
